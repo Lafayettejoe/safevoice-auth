@@ -15,22 +15,17 @@ function ResetPasswordForm() {
     const [success, setSuccess] = useState(false)
 
     function validate() {
-        if (password.length < 8) return 'Password must be at least 8 characters'
-        if (!/[A-Z]/.test(password)) return 'Password must contain an uppercase letter'
-        if (!/[0-9]/.test(password)) return 'Password must contain a number'
+        if (password.length < 8) return 'At least 8 characters'
+        if (!/[A-Z]/.test(password)) return 'Include one uppercase letter'
+        if (!/[0-9]/.test(password)) return 'Include one number'
         return ''
     }
 
     async function handleSubmit(e: React.FormEvent) {
         e.preventDefault()
         setError('')
-
-        const validationError = validate()
-        if (validationError) {
-            setError(validationError)
-            return
-        }
-
+        const err = validate()
+        if (err) { setError(err); return }
         setLoading(true)
         try {
             const res = await fetch('/api/auth/reset-password', {
@@ -38,14 +33,8 @@ function ResetPasswordForm() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ token, password }),
             })
-
             const data = await res.json()
-
-            if (!res.ok) {
-                setError(data.error)
-                return
-            }
-
+            if (!res.ok) { setError(data.error); return }
             setSuccess(true)
             setTimeout(() => router.push('/signin'), 3000)
         } catch {
@@ -57,14 +46,11 @@ function ResetPasswordForm() {
 
     if (!token) {
         return (
-            <div className="text-center">
-                <p className="text-sm" style={{ color: '#8b1a1a' }}>
-                    Invalid reset link. Please request a new one.
-                </p>
-                <Link href="/forgot-password"
-                    className="text-sm font-medium mt-2 block"
-                    style={{ color: '#1a7a44' }}>
-                    Request new link
+            <div className="bg-white rounded-2xl p-8 w-full text-center"
+                style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.08)', border: '1px solid #e6f5ed' }}>
+                <p className="text-sm mb-3" style={{ color: '#8b1a1a' }}>Invalid reset link.</p>
+                <Link href="/forgot-password" className="text-sm font-medium" style={{ color: '#1a7a44' }}>
+                    Request a new link
                 </Link>
             </div>
         )
@@ -72,61 +58,61 @@ function ResetPasswordForm() {
 
     if (success) {
         return (
-            <div className="text-center">
-                <div className="text-4xl mb-4">✅</div>
-                <h2 className="text-2xl font-bold mb-2" style={{ color: '#16181c' }}>
-                    Password reset
-                </h2>
-                <p className="text-sm" style={{ color: '#5a6270' }}>
-                    Your password has been reset successfully. Redirecting to sign in...
-                </p>
+            <div className="bg-white rounded-2xl p-8 w-full text-center"
+                style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.08)', border: '1px solid #e6f5ed' }}>
+                <div className="text-3xl mb-3">✅</div>
+                <h1 className="text-xl font-bold mb-2" style={{ color: '#16181c' }}>Password reset</h1>
+                <p className="text-sm" style={{ color: '#5a6270' }}>Redirecting you to sign in...</p>
             </div>
         )
     }
 
     return (
         <>
-            <h2 className="text-2xl font-bold mb-2" style={{ color: '#16181c' }}>
-                Reset your password
-            </h2>
-            <p className="text-sm mb-6" style={{ color: '#5a6270' }}>
-                Enter your new password below.
-            </p>
-
-            {error && (
-                <div className="mb-4 p-3 rounded-lg text-sm"
-                    style={{ backgroundColor: '#fde8e8', color: '#8b1a1a' }}>
-                    {error}
-                </div>
-            )}
-
-            <form onSubmit={handleSubmit}>
-                <div className="mb-6">
-                    <label htmlFor="password" className="block text-sm font-medium mb-1"
-                        style={{ color: '#16181c' }}>
-                        New password
-                    </label>
-                    <input
-                        id="password"
-                        type="password"
-                        value={password}
-                        onChange={e => setPassword(e.target.value)}
-                        className="w-full px-3 py-2 rounded-lg border text-sm"
-                        style={{ borderColor: error ? '#e57373' : '#d1d5db' }}
-                        placeholder="Min 8 chars, one uppercase, one number"
-                        autoComplete="new-password"
-                    />
+            <div className="bg-white rounded-2xl p-8 w-full"
+                style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.08), 0 4px 16px rgba(10,77,42,0.06)', border: '1px solid #e6f5ed' }}>
+                <div className="flex justify-center mb-4">
+                    <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ backgroundColor: '#0a4d2a' }}>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                            <path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z" fill="white" />
+                        </svg>
+                    </div>
                 </div>
 
-                <button
-                    type="submit"
-                    disabled={loading}
-                    className="w-full py-2 px-4 rounded-lg text-white font-medium text-sm"
-                    style={{ backgroundColor: '#0a4d2a', opacity: loading ? 0.7 : 1 }}
-                >
-                    {loading ? 'Resetting...' : 'Reset password'}
-                </button>
-            </form>
+                <h1 className="text-xl font-bold text-center mb-1" style={{ color: '#16181c' }}>Set new password</h1>
+                <p className="text-center text-sm mb-6" style={{ color: '#5a6270' }}>Must be at least 8 characters</p>
+
+                {error && (
+                    <div className="mb-4 p-3 rounded-lg text-sm" style={{ backgroundColor: '#fde8e8', color: '#8b1a1a' }}>{error}</div>
+                )}
+
+                <form onSubmit={handleSubmit}>
+                    <div className="mb-6">
+                        <label htmlFor="password" className="block text-sm font-medium mb-1" style={{ color: '#16181c' }}>
+                            New password
+                        </label>
+                        <input
+                            id="password"
+                            type="password"
+                            value={password}
+                            onChange={e => setPassword(e.target.value)}
+                            placeholder="Min 8 chars, uppercase, number"
+                            autoComplete="new-password"
+                            className="w-full px-3 py-2 rounded-lg text-sm"
+                            style={{ border: '1px solid #d1d5db', outline: 'none' }}
+                            onFocus={e => e.target.style.borderColor = '#0a4d2a'}
+                            onBlur={e => e.target.style.borderColor = '#d1d5db'}
+                        />
+                    </div>
+
+                    <button type="submit" disabled={loading}
+                        className="w-full py-2 px-4 rounded-lg text-white text-sm font-medium"
+                        style={{ backgroundColor: '#0a4d2a', opacity: loading ? 0.7 : 1 }}>
+                        {loading ? 'Resetting...' : 'Reset password'}
+                    </button>
+                </form>
+            </div>
+            <p className="text-center text-xs mt-4" style={{ color: '#a8d5bb' }}>Protected by end-to-end encryption</p>
         </>
     )
 }

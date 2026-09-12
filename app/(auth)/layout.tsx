@@ -4,21 +4,19 @@ export default function AuthLayout({
     children: React.ReactNode
 }) {
     return (
-        <div className="min-h-screen flex items-center justify-center p-4"
-            style={{ backgroundColor: '#f0faf4' }}>
-            <div className="w-full max-w-md">
-                <div className="text-center mb-8">
-                    <h1 className="text-3xl font-bold" style={{ color: '#0a4d2a' }}>
-                        SafeVoice
-                    </h1>
-                    <p className="text-sm mt-1" style={{ color: '#5a6270' }}>
-                        Safe reporting for everyone
-                    </p>
-                </div>
-                <div className="bg-white rounded-xl shadow-sm border p-8"
-                    style={{ borderColor: '#d1d5db' }}>
-                    {children}
-                </div>
+        <div
+            style={{
+                minHeight: '100vh',
+                backgroundColor: '#f0faf4',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '24px',
+                fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+            }}
+        >
+            <div style={{ width: '100%', maxWidth: '420px' }}>
+                {children}
             </div>
         </div>
     )
