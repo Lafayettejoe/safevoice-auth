@@ -3,12 +3,31 @@ import { db } from '@/lib/db'
 import { hashPassword } from '@/lib/auth'
 import { sendVerificationEmail, generateVerificationCode } from '@/lib/email'
 import { signupSchema } from '@/lib/validations'
+import { signUpRateLimit } from '@/lib/ratelimit'
 
 export async function POST(request: NextRequest) {
     try {
+        // Rate limiting
+        const ip = request.headers.get('x-forwarded-for') ?? '127.0.0.1'
+        const { success, limit, remaining, reset } = await signUpRateLimit.limit(ip)
+
+        if (!success) {
+            return NextResponse.json(
+                { error: 'Too many signup attempts. Please try again later.' },
+                {
+                    status: 429,
+                    headers: {
+                        'X-RateLimit-Limit': limit.toString(),
+                        'X-RateLimit-Remaining': remaining.toString(),
+                        'X-RateLimit-Reset': reset.toString(),
+                        'Retry-After': Math.ceil((reset - Date.now()) / 1000).toString(),
+                    }
+                }
+            )
+        }
+
         const body = await request.json()
 
-        // Server-side validation
         const result = signupSchema.safeParse(body)
         if (!result.success) {
             return NextResponse.json(
@@ -19,7 +38,6 @@ export async function POST(request: NextRequest) {
 
         const { name, email, password } = result.data
 
-        // Check if email already exists
         const existingUser = await db.user.findUnique({
             where: { email }
         })
@@ -31,10 +49,8 @@ export async function POST(request: NextRequest) {
             )
         }
 
-        // Hash the password
         const hashedPassword = await hashPassword(password)
 
-        // Create the user
         const user = await db.user.create({
             data: {
                 name,
@@ -43,11 +59,9 @@ export async function POST(request: NextRequest) {
             }
         })
 
-        // Generate verification code
         const code = generateVerificationCode()
-        const expiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15 minutes
+        const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
 
-        // Save verification code to database
         await db.verificationCode.create({
             data: {
                 userId: user.id,
@@ -57,7 +71,6 @@ export async function POST(request: NextRequest) {
             }
         })
 
-        // Send verification email
         await sendVerificationEmail(email, code)
 
         return NextResponse.json(
