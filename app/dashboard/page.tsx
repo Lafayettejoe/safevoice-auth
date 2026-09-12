@@ -68,6 +68,27 @@ export default async function DashboardPage() {
                             border: '1px solid #e2f0e8',
                         }}>
                             {user.id}
+
+                            <div style={{ marginTop: '20px', display: 'flex', gap: '12px' }}>
+                                <a href="/billing" style={{ textDecoration: 'none' }}>
+                                    <button style={{
+                                        padding: '9px 20px', borderRadius: '8px', border: 'none',
+                                        backgroundColor: '#0a4d2a', color: '#ffffff',
+                                        fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+                                    }}>
+                                        Manage billing
+                                    </button>
+                                </a>
+                                <a href="/billing/plans" style={{ textDecoration: 'none' }}>
+                                    <button style={{
+                                        padding: '9px 20px', borderRadius: '8px',
+                                        border: '1px solid #d1d5db', backgroundColor: '#ffffff',
+                                        color: '#374151', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+                                    }}>
+                                        View plans
+                                    </button>
+                                </a>
+                            </div>
                         </code>
                     </div>
                 </div>

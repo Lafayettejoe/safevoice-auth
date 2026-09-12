@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-const protectedRoutes = ['/dashboard']
+const protectedRoutes = ['/dashboard', '/billing']
 const authRoutes = ['/signin', '/signup', '/forgot-password', '/verify', '/reset-password']
 
 export function proxy(request: NextRequest) {

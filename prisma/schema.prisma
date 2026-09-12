@@ -19,6 +19,7 @@ model User {
   sessions            Session[]
   verificationCodes   VerificationCode[]
   passwordResetTokens PasswordResetToken[]
+  subscription        Subscription?
 }
 
 model Session {
@@ -54,4 +55,73 @@ model PasswordResetToken {
   createdAt DateTime @default(now())
 
   @@index([userId])
+}
+
+// Plan: the three available plans in SafeVoice
+model Plan {
+  id        String      @id @default(cuid())
+  name      String
+  interval  PlanInterval
+  amount    Int         // stored in kobo: 0, 500000, 4800000
+  currency  String      @default("NGN")
+  createdAt DateTime    @default(now())
+
+  subscriptions Subscription[]
+}
+
+// Subscription: one row per user showing their current plan
+model Subscription {
+  id                  String             @id @default(cuid())
+  userId              String             @unique
+  user                User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId              String
+  plan                Plan               @relation(fields: [planId], references: [id])
+  status              SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart  DateTime
+  currentPeriodEnd    DateTime
+  cancelAtPeriodEnd   Boolean            @default(false)
+  cancellationReason  String?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  payments PaymentLog[]
+  @@index([userId])
+}
+
+// PaymentLog: append-only record of every payment event
+// Every stage (initiated, verified, fulfilled, failed) is a separate row
+model PaymentLog {
+  id                String       @id @default(cuid())
+  subscriptionId    String?
+  subscription      Subscription? @relation(fields: [subscriptionId], references: [id])
+  userId            String
+  stage             PaymentStage
+  amount            Int          // in kobo
+  currency          String       @default("NGN")
+  providerReference String?      // Flutterwave transaction ID
+  metadata          Json?
+  createdAt         DateTime     @default(now())
+
+  @@index([providerReference])
+  @@index([userId])
+  @@index([stage])
+}
+
+enum PlanInterval {
+  FREE
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentStage {
+  INITIATED
+  VERIFIED
+  FULFILLED
+  FAILED
 }
