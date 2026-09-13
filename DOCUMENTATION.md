@@ -1,3 +1,4 @@
+# Assessment 1: Authentication Slice
 # SafeVoice Authentication Slice
 
 ## Section 1: What This Is
@@ -557,3 +558,623 @@ setup. Choosing and verifying the full infrastructure stack in the first
 30 minutes, including running a test query to confirm connectivity, would
 have saved hours of debugging that had nothing to do with authentication
 logic.
+
+---
+
+# Assessment 2: Payment and Billing Slice
+# SafeVoice Payment and Billing Slice
+
+## Section 1: What This Is
+
+This repository extends the SafeVoice authentication slice with a complete
+subscription and billing system built on Flutterwave in test mode. An
+organisation can view available plans, subscribe to a monthly or yearly
+camp license, upgrade mid-cycle with proration applied, downgrade at the
+end of their current period, and cancel while retaining access until the
+paid period ends. Every payment event is recorded as a separate row in an
+append-only payment log.
+
+This slice deliberately excludes all product features beyond billing. There
+is no landing page, no marketing page, and nothing behind the paywall. The
+thing being sold is a plan flag on a subscription record and nothing more.
+Reusing the authentication system from Assessment 1 is stated here as
+required by the brief.
+
+---
+
+## Section 2: How To Run It
+
+**Requirements:** Node.js v18 or above, Git
+
+**Step 1: Clone the repository**
+```bash
+git clone https://github.com/Lafayettejoe/safevoice-auth.git
+cd safevoice-auth
+```
+
+**Step 2: Install dependencies**
+```bash
+npm install
+```
+
+**Step 3: Set up environment variables**
+
+Copy `.env.example` to `.env.local` and fill in all values:
+
+```bash
+cp .env.example .env.local
+```
+
+| Variable | Where to get it |
+|---|---|
+| `DATABASE_URL` | neon.tech — free PostgreSQL project |
+| `JWT_SECRET` | Any random string, minimum 32 characters |
+| `RESEND_API_KEY` | resend.com — free account |
+| `RESEND_FROM_EMAIL` | `onboarding@resend.dev` for testing |
+| `UPSTASH_REDIS_REST_URL` | upstash.com — free Redis database |
+| `UPSTASH_REDIS_REST_TOKEN` | upstash.com — same Redis database |
+| `FLW_PUBLIC_KEY` | Flutterwave dashboard → Settings → API Keys (test mode) |
+| `FLW_SECRET_KEY` | Flutterwave dashboard → Settings → API Keys (test mode) |
+| `FLW_WEBHOOK_HASH` | Any string you choose — must match what you set in Flutterwave Settings → Webhooks → Secret Hash |
+| `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` for local development |
+
+**Step 4: Push the database schema**
+```bash
+npx prisma db push
+npx prisma generate
+```
+
+**Step 5: Seed the plans**
+```bash
+npm run seed
+```
+
+This creates three plan records in the database: Free (₦0), Monthly
+(₦5,000), and Yearly (₦48,000).
+
+**Step 6: Start the development server**
+```bash
+npm run dev
+```
+
+**Step 7: Open in browser**
+
+Visit `http://localhost:3000`. Sign in, then click **Manage billing** or
+**View plans** from the dashboard.
+
+**Step 8: Test payments**
+
+Use these Flutterwave test card details:
+
+| Field | Value |
+|---|---|
+| Card number | 5531 8866 5214 2950 |
+| Expiry | 09/32 |
+| CVV | 564 |
+| PIN | 3310 |
+| OTP | 12345 |
+
+**Step 9: Test webhooks locally**
+
+Install ngrok and run:
+```bash
+ngrok http 3000
+```
+
+Update your Flutterwave webhook URL to the ngrok forwarding address
+followed by `/api/billing/webhook`.
+
+---
+
+## Section 3: The Flow, Step By Step
+
+### Viewing plans
+
+The user navigates to `/billing/plans` from the dashboard. The frontend
+sends a GET request to `/api/billing/plans` in
+`app/api/billing/plans/route.ts`. The server reads the authenticated
+user from the session cookie, fetches all three plans from the Plan table
+ordered by amount, and calls `getOrCreateFreeSubscription` from
+`lib/billing.ts` to ensure every user has a subscription record. It
+returns the plans and the user's current subscription. The page renders
+three cards showing Free, Monthly, and Yearly with the current plan
+highlighted.
+
+### Subscribing to a plan
+
+The user clicks Subscribe on the Monthly or Yearly card. The frontend
+sends a POST to `/api/billing/checkout` in
+`app/api/billing/checkout/route.ts`. The server checks the rate limit,
+verifies the session, validates the plan ID, generates a unique
+transaction reference using `generateTxRef` from `lib/billing.ts`, writes
+a INITIATED row to the PaymentLog table, then calls `initiatePayment` from
+`lib/flutterwave.ts` which hits the Flutterwave `/v3/payments` endpoint
+and returns a hosted payment link. The frontend redirects the user to that
+link.
+
+The user completes payment on Flutterwave's page using their card. Flutterwave
+redirects the user back to `/billing/return` with the transaction ID and
+status in the URL.
+
+### Verifying payment
+
+The return page at `app/billing/return/page.tsx` reads the transaction ID
+from the URL and sends a POST to `/api/billing/verify` in
+`app/api/billing/verify/route.ts`. The server first checks idempotency
+— if a FULFILLED row already exists for this transaction ID, it returns
+early without processing again. Otherwise it calls `verifyTransaction`
+from `lib/flutterwave.ts` which hits the Flutterwave
+`/v3/transactions/{id}/verify` endpoint. If the payment is not
+successful, a FAILED row is written to PaymentLog. If successful, a
+VERIFIED row is written, the Subscription record is upserted with the
+new plan and period dates calculated by `calculatePeriodEnd` from
+`lib/billing.ts`, and a FULFILLED row is written. The user is redirected
+to `/billing?success=true`.
+
+### Upgrading mid-cycle with proration
+
+The user clicks Upgrade on a higher-tier plan. The frontend sends a POST
+to `/api/billing/upgrade` in `app/api/billing/upgrade/route.ts`. The
+server calls `calculateProration` from `lib/billing.ts` with the current
+period start, period end, current plan amount, and new plan amount. The
+proration calculation produces a credit for the unused days and an amount
+to charge. A INITIATED row is written to PaymentLog with the full
+proration breakdown in the metadata field. The prorated amount is passed
+to `initiatePayment` and the user is sent to Flutterwave to pay only the
+difference.
+
+### Downgrading
+
+The user clicks Downgrade on a lower-tier plan. The frontend sends a POST
+to `/api/billing/upgrade`. The server detects the new plan amount is lower
+than the current plan amount and schedules the change by setting
+`cancelAtPeriodEnd: true` on the Subscription record with a note in
+`cancellationReason`. No payment is taken. The change applies automatically
+at the end of the current period. A FULFILLED log row records the event.
+
+### Cancelling
+
+The user clicks Cancel subscription on the billing page at `/billing`. A
+confirmation modal appears asking for an optional reason. The user selects
+a reason and confirms. The frontend sends a POST to `/api/billing/cancel`
+in `app/api/billing/cancel/route.ts`. The server sets
+`cancelAtPeriodEnd: true` and saves the cancellation reason to the
+Subscription record. The user keeps full access until `currentPeriodEnd`.
+A FULFILLED log row records the cancellation event with the access-until
+date in the metadata.
+
+### Webhook handling
+
+Flutterwave sends a POST to `/api/billing/webhook` in
+`app/api/billing/webhook/route.ts` whenever a payment event occurs. The
+server first checks the `verif-hash` header against the `FLW_WEBHOOK_HASH`
+environment variable using `verifyWebhookSignature` from
+`lib/flutterwave.ts`. If the signature does not match, it returns 401
+immediately without processing. If the signature matches, it checks
+idempotency — if a FULFILLED row already exists for this transaction ID,
+it returns `Already processed` without creating any new records. Otherwise
+it logs the event and processes it.
+
+---
+
+## Section 4: The Data Model
+
+### Plan table
+Stores the three available plans. Seeded once on setup. Never mutated
+during normal operation.
+
+| Column | Type | Decision |
+|---|---|---|
+| id | String (cuid) | Unique identifier |
+| name | String | Human-readable: Free, Monthly, Yearly |
+| interval | PlanInterval enum | FREE, MONTHLY, or YEARLY — drives period calculation logic |
+| amount | Int | Stored in kobo. Never a decimal. 0, 500000, or 4800000. |
+| currency | String (default NGN) | Stored alongside amount so the pair is always complete |
+
+### Subscription table
+One row per user. Upserted on every successful payment.
+
+| Column | Type | Decision |
+|---|---|---|
+| userId | String (unique, FK) | Unique constraint enforces one subscription per user at the database level |
+| planId | FK to Plan | References the active plan |
+| status | SubscriptionStatus | ACTIVE, CANCELLED, or EXPIRED |
+| currentPeriodStart | DateTime | Set at payment verification time |
+| currentPeriodEnd | DateTime | Calculated by `calculatePeriodEnd` — 1 month or 1 year from start |
+| cancelAtPeriodEnd | Boolean | True means cancel at period end. User keeps access until then. |
+| cancellationReason | String? | Optional. Populated from the cancellation prompt. |
+
+### PaymentLog table
+Append-only. Every stage of every payment is a separate row. Never
+updated. Never deleted.
+
+| Column | Type | Decision |
+|---|---|---|
+| stage | PaymentStage | INITIATED, VERIFIED, FULFILLED, or FAILED — one row per stage |
+| amount | Int | In kobo. The amount at that specific stage. |
+| providerReference | String? | Flutterwave transaction ID. Indexed for idempotency lookups. |
+| metadata | Json? | Stores proration breakdown, cancellation reason, event type |
+
+**Constraints that make invalid states impossible:**
+
+- `userId @unique` on Subscription — a user cannot have two active
+  subscriptions simultaneously
+- `providerReference @@index` on PaymentLog — fast idempotency lookup
+  before any processing
+- `stage` as an enum — only valid payment stages can be recorded
+- `amount Int` — storing as an integer makes it structurally impossible
+  to store a decimal money value
+
+---
+
+## Section 5: The Concepts
+
+### Minor units and why money is never a decimal
+
+**What it is.** Minor units means storing money as the smallest
+indivisible unit of a currency. For Nigerian Naira, the minor unit is
+kobo. ₦5,000 is stored as 500,000 kobo. Every amount in SafeVoice is
+an integer in kobo — never a decimal.
+
+**Why it is needed.** Floating point numbers cannot represent most
+decimal values exactly in binary. The number 0.1 in a computer is actually
+0.10000000000000000555... Arithmetic on decimals produces rounding errors.
+For money, rounding errors are not acceptable. Storing ₦5,000.50 as a
+float and doing arithmetic on it can produce ₦5,000.4999999 or
+₦5,000.5000001 depending on the operation. Storing 500050 kobo and doing
+integer arithmetic always produces the exact result.
+
+**How I implemented it.** Every amount in the Plan table, Subscription
+table, and PaymentLog table is an Int column storing kobo. The
+`lib/billing.ts` file works exclusively in kobo. Amounts are only
+converted to Naira for display, by dividing by 100 in the UI components.
+Flutterwave accepts amounts in Naira so the conversion `amount / 100`
+happens only at the point of calling `initiatePayment`.
+
+**What I chose against, and why.** Storing amounts as a Decimal type
+with two fixed decimal places is common but still susceptible to
+representation issues across different database drivers and programming
+languages. Integer kobo storage is unambiguous in every layer of the
+stack.
+
+---
+
+### The payment lifecycle — initiation, verification, and fulfilment
+
+**What it is.** Every payment in SafeVoice goes through three distinct
+stages recorded as separate rows in the PaymentLog table. Initiation is
+when the payment request is created. Verification is when Flutterwave
+confirms the payment was received. Fulfilment is when the subscription
+is actually activated in SafeVoice's database.
+
+**Why it is needed.** Without separating these three stages, there is no
+audit trail. If a user is charged but their subscription is not activated,
+there is no record of what happened at which point. If Flutterwave sends
+a duplicate event, there is no way to know the payment was already
+fulfilled. Keeping three separate rows means every state transition is
+recorded permanently and can be reconstructed in a dispute.
+
+**How I implemented it.** In `app/api/billing/checkout/route.ts`, an
+INITIATED row is written before the Flutterwave call. In
+`app/api/billing/verify/route.ts`, a VERIFIED row is written after
+Flutterwave confirms the transaction, and a FULFILLED row is written after
+the Subscription record is updated. The PaymentLog table is append-only
+— no row is ever updated or deleted.
+
+**What I chose against, and why.** Storing only the final subscription
+status without a payment log is simpler but produces no history. If a
+customer disputes a charge from three months ago, the only evidence
+available is the current subscription status, which may have changed
+several times since then. The log is the history.
+
+---
+
+### The payment log and what it proves in a dispute
+
+**What it is.** The PaymentLog table is an immutable record of every
+payment event. Each row has a timestamp, a stage, an amount, a
+Flutterwave transaction reference, and a metadata field. Together these
+rows tell the complete story of every transaction.
+
+**Why it is needed.** When a customer disputes a charge, the payment
+processor asks for evidence that the charge was legitimate and that the
+service was delivered. Without a log, the only evidence is the current
+state of the subscription — which may have been cancelled or modified
+since the disputed charge. The log shows what happened, when it happened,
+and what the user received.
+
+**How I implemented it.** Every route that handles a payment event writes
+to PaymentLog before returning a response. The proration breakdown for
+upgrades is stored in the metadata field of the INITIATED row, including
+days remaining, credit amount, and amount charged, so it is permanently
+on record.
+
+**What I chose against, and why.** Relying on Flutterwave's own
+transaction history as the sole record means SafeVoice has no independent
+audit trail. If the integration with Flutterwave changes, or if access
+to the Flutterwave account is lost, the history is gone. Maintaining an
+independent log gives SafeVoice control over its own evidence.
+
+---
+
+### Idempotency in payments
+
+**What it is.** An idempotent payment operation produces the same result
+whether it is processed once or many times. In SafeVoice, if Flutterwave
+sends the same webhook twice for the same transaction, the second one is
+recognised as a duplicate and ignored without creating any new records or
+changing any subscription state.
+
+**Why it is needed.** Flutterwave can send the same webhook multiple times
+if its first delivery attempt times out or fails. Without idempotency, a
+single payment could activate a subscription twice, create duplicate log
+entries, or credit a user's account multiple times. This would be a
+financial error.
+
+**How I implemented it.** Before processing any webhook or verification
+request, the server queries the PaymentLog table for a FULFILLED row with
+the matching `providerReference`. If one exists, it returns
+`Already processed` immediately without touching the Subscription table
+or creating any new rows. The idempotency key is the Flutterwave
+transaction ID stored in `providerReference`.
+
+**What I chose against, and why.** Using the transaction reference in a
+separate idempotency table is an alternative. I chose to query the
+PaymentLog directly because a FULFILLED row already means the payment was
+processed — it is the natural idempotency signal without needing a
+separate table.
+
+---
+
+### Webhook signature verification
+
+**What it is.** When Flutterwave sends a webhook to SafeVoice, it
+includes a `verif-hash` header containing a secret string. SafeVoice
+checks this header against the `FLW_WEBHOOK_HASH` environment variable
+before processing the webhook. If the header is missing or wrong, the
+webhook is rejected immediately.
+
+**Why it is needed.** Without signature verification, anyone who knows
+the webhook URL can send fake payment events to SafeVoice. A malicious
+actor could send a fabricated `charge.completed` event and activate a
+subscription without paying. Signature verification proves the event
+came from Flutterwave and not from an attacker.
+
+**How I implemented it.** The `verifyWebhookSignature` function in
+`lib/flutterwave.ts` compares the `verif-hash` header against
+`process.env.FLW_WEBHOOK_HASH`. The same string is configured in the
+Flutterwave dashboard under Settings → Webhooks → Secret Hash. The
+webhook route returns HTTP 401 if the signatures do not match.
+
+**What I chose against, and why.** HMAC-SHA256 signature verification
+is a more cryptographically robust alternative used by Stripe. Flutterwave
+uses a simpler shared secret approach. I used Flutterwave's native method
+because it is what the provider supports and because the shared secret
+is sufficient when stored securely in environment variables.
+
+---
+
+### Proration
+
+**What it is.** Proration is the calculation of a fair partial charge
+when a user upgrades their plan mid-cycle. Instead of charging the full
+new plan price, the system calculates how many days of the current plan
+are unused, converts that to a credit, and charges only the difference.
+
+**Why it is needed.** Without proration, upgrading mid-cycle would either
+overcharge the user (full new plan price with no credit for the current
+plan) or require cancelling and restarting the billing cycle, losing the
+days already paid for. Proration makes upgrades fair and transparent.
+
+**How I implemented it.** The `calculateProration` function in
+`lib/billing.ts` takes the current period start, period end, current plan
+amount, and new plan amount. It calculates days remaining and total days
+using ceiling division, computes the credit as a floor division to avoid
+decimal amounts, and subtracts from the new plan amount.
+
+**Real numbers from my test:**
+- Current plan: Monthly at ₦5,000 (500,000 kobo)
+- Period start: 12 days ago
+- Period end: 18 days from now
+- Total days: 30
+- Days remaining: 18
+- Credit: floor(18/30 × 500,000) = 300,000 kobo = ₦3,000
+- New plan: Yearly at ₦48,000 (4,800,000 kobo)
+- Amount charged: 4,800,000 − 300,000 = 4,500,000 kobo = **₦45,000**
+
+```ts
+const creditAmount = Math.floor((daysRemaining / totalDays) * currentAmount)
+const amountToCharge = Math.max(0, newAmount - creditAmount)
+```
+
+**What I chose against, and why.** Charging the full new plan price
+and giving a credit on the next invoice is an alternative. This is
+simpler to implement but requires a credit system. Charging only the
+prorated amount immediately is cleaner for the user and requires no
+credit tracking.
+
+---
+
+### Cancellation and period-end access
+
+**What it is.** When a user cancels their subscription, SafeVoice does
+not immediately remove their access. Instead, it sets `cancelAtPeriodEnd`
+to true on the Subscription record. The user keeps full access until
+`currentPeriodEnd`, after which the subscription moves to the free plan.
+
+**Why it is needed.** The user paid for a full billing period. Cutting
+off access immediately on cancellation would mean taking payment for a
+period and then not delivering it. This is a legal and ethical obligation
+in most jurisdictions — you cannot take money for a service and then not
+provide it.
+
+**How I implemented it.** The cancel route sets `cancelAtPeriodEnd: true`
+and saves the optional cancellation reason. The billing page reads this
+flag and shows a "CANCELLING" status with the access-until date. The
+cancellation event is logged in PaymentLog with the access-until date
+in the metadata field.
+
+**What I chose against, and why.** Immediate cancellation with a refund
+is an alternative. This is more complex — it requires calculating a
+refund amount and initiating a refund through Flutterwave. Period-end
+access is simpler, fairer, and the standard practice for subscription
+businesses.
+
+---
+
+### Why card details are never stored — PCI scope
+
+**What it is.** SafeVoice never receives, processes, or stores any card
+number, CVV, expiry date, or PIN. The user enters their card details
+directly on Flutterwave's hosted payment page, not on SafeVoice's pages.
+
+**Why it is needed.** Storing card details makes a system subject to
+PCI DSS (Payment Card Industry Data Security Standard) compliance
+requirements. PCI DSS is a set of security standards that require annual
+audits, penetration testing, network segmentation, and significant
+engineering investment. A startup or bootcamp project that stores card
+details and is not PCI compliant is a serious security and legal liability.
+
+**How I implemented it.** SafeVoice uses Flutterwave's hosted payment
+link approach. The `initiatePayment` function returns a URL on
+Flutterwave's domain. The user is redirected there to enter their card
+details. Flutterwave processes the payment and redirects back to
+SafeVoice with only a transaction ID. SafeVoice never sees the card.
+
+**What I chose against, and why.** Collecting card details directly in
+SafeVoice's own form using Flutterwave's inline SDK would give a smoother
+user experience without a redirect. But it would bring card data into
+SafeVoice's domain, creating PCI scope. The redirect approach keeps
+SafeVoice completely outside PCI scope with no compliance burden.
+
+---
+
+### Rate limiting on payment endpoints
+
+**What it is.** The checkout initiation endpoint is rate limited so that
+a single IP address cannot trigger unlimited payment initiations in a
+short period.
+
+**Why it is needed.** Without rate limiting, a malicious actor could
+script thousands of checkout initiations, each creating a PaymentLog
+row and making a request to Flutterwave's API. This could exhaust
+Flutterwave API rate limits, fill the PaymentLog table with junk data,
+and create noise that makes real payment logs hard to audit.
+
+**How I implemented it.** The existing `signUpRateLimit` from
+`lib/ratelimit.ts` is reused on the checkout endpoint with a
+`checkout:` prefix to keep the rate limit bucket separate from signup.
+It uses Upstash Redis with a sliding window algorithm.
+
+**What I chose against, and why.** A separate dedicated rate limiter
+for billing would be cleaner and allow different thresholds. I reused
+the existing limiter to avoid adding complexity during the assessment
+window. In production, billing endpoints would have their own dedicated
+rate limit configuration.
+
+---
+
+## Section 6: What Went Wrong
+
+### Problem 1: Flutterwave webhook URL rejecting localhost
+
+**Symptom.** When setting up the Flutterwave webhook in the dashboard,
+the webhook URL field rejected `http://localhost:3000/api/billing/webhook`
+with an invalid URL error.
+
+**Investigation.** I checked whether the URL format was wrong — it was
+not. I tried variations of the localhost URL. All were rejected.
+
+**Cause.** Flutterwave requires a publicly accessible URL for webhooks.
+Localhost is only accessible on the local machine. Flutterwave's servers
+cannot reach it.
+
+**Fix.** I installed ngrok which creates a secure tunnel from a public
+URL to localhost. Running `ngrok http 3000` produced a public URL at
+`https://certified-scorecard-coffee.ngrok-free.dev`. I updated the
+Flutterwave webhook URL to use the ngrok address followed by
+`/api/billing/webhook`.
+
+---
+
+### Problem 2: Neon database going to sleep during testing
+
+**Symptom.** While testing the billing flow, the browser showed a Prisma
+error: `Can't reach database server at ep-sweet-leaf-zalixdbs-pooler`.
+The error appeared after a period of inactivity.
+
+**Investigation.** I checked the Neon dashboard. The database status
+showed it had been paused automatically.
+
+**Cause.** Neon's free tier automatically pauses databases after 5
+minutes of inactivity to save resources. The first request after the
+pause fails while the database wakes up.
+
+**Fix.** I manually resumed the database from the Neon dashboard and
+waited 30 seconds for it to become active again. I also updated
+`lib/db.ts` to pass the `datasources` configuration explicitly to
+Prisma, which helps it reconnect cleanly after the database wakes up
+rather than throwing an unhandled error.
+
+---
+
+### Problem 3: The @types/flutterwave-node-v3 package does not exist
+
+**Symptom.** Running `npm install --save-dev @types/flutterwave-node-v3`
+returned a 404 error — package not found.
+
+**Investigation.** I checked the npm registry. No `@types` package exists
+for `flutterwave-node-v3`.
+
+**Cause.** The Flutterwave Node.js SDK does not have a community-maintained
+types package on the DefinitelyTyped registry.
+
+**Fix.** I skipped the types package entirely and used direct fetch calls
+to the Flutterwave REST API in `lib/flutterwave.ts` instead of using the
+SDK. I defined my own TypeScript interfaces for the Flutterwave response
+shapes. This gave full type safety without depending on an SDK.
+
+---
+
+## Section 7: What This Slice Does Not Handle
+
+**Outside the brief by design:**
+- Actual subscription renewal — the system records periods but does not
+  automatically renew or charge at period end. A production system would
+  require a scheduled job or Flutterwave's recurring billing feature.
+- Invoice generation — no PDF invoices are produced.
+- Multi-currency support — NGN only.
+- Trial periods — no free trial logic exists.
+- Refunds — cancellation retains access but no refund is initiated.
+
+**Would need before real users:**
+- A production webhook URL — ngrok URLs expire. A deployed server with
+  a permanent URL is required.
+- Scheduled job for period-end processing — when `cancelAtPeriodEnd` is
+  true and `currentPeriodEnd` passes, the subscription should
+  automatically move to the free plan. This requires a cron job that
+  does not exist yet.
+- Flutterwave live mode keys — all testing used test mode keys. Live
+  mode requires business verification with Flutterwave.
+- Email receipts — no confirmation email is sent after a successful
+  payment.
+
+**Left out due to time:**
+- Automated tests for the billing routes and proration calculation.
+- A proper admin view showing all subscriptions across all users.
+
+---
+
+## Section 8: If I Built This Again
+
+If I built this again, I would implement the payment log as the single
+source of truth for subscription state from the start, deriving the
+current subscription status by querying the most recent FULFILLED log
+entry rather than maintaining a separate mutable Subscription record.
+The current design keeps a Subscription table that is updated on every
+payment event, which means the table stores the present but not the
+history — the log stores the history. In a dispute, the log is what
+matters. Building the system so that entitlement is derived directly
+from the log would have made both the code simpler and the audit trail
+more reliable, because there would be no possibility of the Subscription
+record and the PaymentLog ever being out of sync.
