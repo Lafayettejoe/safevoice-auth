@@ -1775,3 +1775,549 @@ middleware layer — either direct S3 upload from the client using a
 pre-signed URL, or the direct FormData approach I ended up using —
 would have saved several hours of debugging and meant the AI pipeline
 could have been tested from the first attempt rather than the fourth.
+
+---
+
+# Assessment 4: The Records and Access Slice
+
+## Section 1: What This Is
+
+This slice adds a case notes system to SafeVoice where authenticated
+case workers can create, view, and delete their own records. Every
+database query is scoped to the authenticated user inside the query
+itself — making it structurally impossible for one user to access
+another user's records. Every deletion is recorded in an append-only
+audit log before the record is removed. Navigation between list, detail,
+and create views happens without full page loads while the URL updates
+so every view is bookmarkable.
+
+This slice deliberately excludes editing, search, tags, sharing, and
+collaboration. Create, list, view, and delete only. Authentication is
+reused from Assessment 1 as permitted by the brief.
+
+---
+
+## Section 2: How To Run It
+
+**Requirements:** Node.js v18 or above, Git
+
+**Step 1: Clone the repository**
+```bash
+git clone https://github.com/Lafayettejoe/safevoice-auth.git
+cd safevoice-auth
+```
+
+**Step 2: Install dependencies**
+```bash
+npm install
+```
+
+**Step 3: Set up environment variables**
+
+Copy `.env.example` to `.env.local` and fill in all values from
+previous assessments. No new environment variables are required for
+Assessment 4.
+
+**Step 4: Push the database schema**
+```bash
+npx prisma db push
+npx prisma generate
+```
+
+**Step 5: Start the development server**
+```bash
+npm run dev
+```
+
+**Step 6: Access the records flow**
+
+Sign in, then click **View records** on the dashboard, or go directly
+to `http://localhost:3000/records`.
+
+---
+
+## Section 3: The Flow, Step By Step
+
+### Viewing the list
+
+The user navigates to `/records` from the dashboard. The URL state is
+`?view=list` or no view parameter. The frontend sends a GET request to
+`/api/records` in `app/api/records/route.ts`. The server reads the
+session cookie, verifies the user, and queries the CaseNote table with
+`where: { userId: user.id }`. Only records belonging to the
+authenticated user are returned. The query returns publicId, title,
+content, createdAt, and updatedAt — never the internal database id.
+The page renders the list. If no records exist, a genuine empty state
+is shown with a create button.
+
+### Creating a record
+
+The user clicks **New record**. The URL updates to `?view=create`
+without a full page reload. The user fills in a title and content.
+Client-side validation checks both fields are non-empty before
+submitting. The frontend sends a POST to `/api/records`. The server
+validates with Zod, creates the CaseNote record with the authenticated
+user's id, and returns the new record. The frontend redirects to
+`?view=list`.
+
+### Viewing a record
+
+The user clicks a note from the list. The URL updates to
+`?view=detail&id={publicId}`. The frontend sends a GET to
+`/api/records/{publicId}` in `app/api/records/[publicId]/route.ts`.
+The server queries with both `publicId` and `userId: user.id` in the
+where clause. If the record exists but belongs to another user, the
+query returns null and the server returns 404 — not 403. This prevents
+leaking that the record exists. The detail view renders the full title
+and content.
+
+### Deleting a record
+
+The user clicks **Delete** on the detail view. A confirmation modal
+appears explaining that a deletion record will be written to the audit
+log. The user confirms. The frontend sends a DELETE to
+`/api/records/{publicId}`. The server finds the record scoped to the
+authenticated user. Before deleting, it writes an AuditLog row
+capturing the userId, action, entityType, entityId, and metadata
+including the note title and deletion timestamp. Only after the audit
+log is written does it call `db.caseNote.delete`. The frontend
+redirects to `?view=list`.
+
+---
+
+## Section 4: The Data Model
+
+### CaseNote table
+Stores case notes created by case workers. Every row belongs to exactly
+one user.
+
+| Column | Type | Decision |
+|---|---|---|
+| id | String (cuid) | Internal database identifier. Never exposed in URLs or the interface. |
+| publicId | String (unique, cuid) | The identifier exposed in URLs. A separate field from id so the internal key is never revealed. |
+| userId | String (FK) | Foreign key to User with cascade delete. Scopes every record to its owner. Indexed for fast filtering. |
+| title | String | Required. Not nullable. |
+| content | String | Required. Not nullable. |
+| createdAt | DateTime | Set at creation. Immutable. |
+| updatedAt | DateTime | Updated automatically by Prisma on every write. |
+
+**Indexes:**
+- `@@index([userId])` — speeds up the list query which filters by userId
+- `@@index([publicId])` — speeds up the detail query which filters by publicId
+- `@unique` on publicId — ensures no two records share a public identifier
+
+### AuditLog table
+Append-only record of every deletion event. Never updated. Never
+deleted.
+
+| Column | Type | Decision |
+|---|---|---|
+| id | String (cuid) | Unique identifier |
+| userId | String | Who performed the action. Not a foreign key — the audit log must survive user deletion. |
+| action | String | What happened — DELETE in this slice |
+| entityType | String | What type of record was affected — CaseNote |
+| entityId | String | The publicId of the deleted record |
+| metadata | Json? | Title of the deleted note and deletion timestamp |
+| createdAt | DateTime | When the deletion happened |
+
+**Constraints that make invalid states impossible:**
+
+- `publicId @unique` on CaseNote — two records cannot share a public
+  identifier. If a publicId is somehow reused, the database rejects it.
+- `userId @@index` on CaseNote — the query planner uses this index for
+  every list and detail query. Without it, every query would be a full
+  table scan.
+- `userId` on CaseNote with cascade delete — when a user is deleted,
+  their case notes are deleted too. No orphaned records.
+- AuditLog userId is a plain string, not a foreign key — if a user is
+  deleted, their audit history is retained. The log is evidence. It must
+  survive user deletion.
+
+---
+
+## Section 5: The Concepts
+
+### Authentication versus authorisation
+
+**What it is.** Authentication is proving who you are. Authorisation
+is proving you are allowed to do what you are asking. Authentication
+happens at sign in — the server verifies the password and issues a
+session token. Authorisation happens on every subsequent request —
+the server checks whether the authenticated user is allowed to access
+the specific resource they requested.
+
+**Why it is needed.** A user who is authenticated is not automatically
+authorised to access every record in the system. Without authorisation,
+any signed-in user could read or delete any other user's records simply
+by knowing or guessing the record identifier. Authentication proves
+the user is real. Authorisation proves this record belongs to them.
+
+**How I implemented it.** Every API route in this slice calls
+`getCurrentUser` first to verify authentication. The database query
+then includes `userId: user.id` in the where clause to enforce
+authorisation. These are two separate checks — the first establishes
+identity, the second enforces ownership.
+
+**What I chose against, and why.** Checking ownership after fetching
+the record — fetch first, compare userId second — is a common pattern
+that is wrong. If the comparison check is ever forgotten on a new route,
+the record is exposed. Scoping the query itself makes the authorisation
+structurally impossible to bypass, even if a developer forgets to add
+an explicit check.
+
+---
+
+### Scoping the query versus checking after the fetch
+
+**What it is.** Query scoping means including the ownership condition
+inside the database query — `where: { publicId, userId: user.id }`.
+Post-fetch checking means fetching the record without a userId
+condition, then comparing the returned record's userId to the
+authenticated user's id in application code.
+
+**Why it is needed.** Post-fetch checking has a structural weakness.
+If a developer adds a new route and forgets the ownership check, the
+record is exposed with no database-level protection. Query scoping
+moves the ownership enforcement into the database query itself — the
+database will simply return no rows if the userId does not match,
+regardless of what application code does or does not check.
+
+**How I implemented it.** Every query in `app/api/records/route.ts`
+and `app/api/records/[publicId]/route.ts` includes `userId: user.id`
+in the where clause. The GET all query uses
+`where: { userId: user.id }`. The GET single and DELETE queries use
+`where: { publicId, userId: user.id }`. If the publicId exists but
+belongs to another user, the query returns null — the application
+never sees the other user's data.
+
+**What I chose against, and why.** I could have fetched by publicId
+alone and then checked `if (note.userId !== user.id) return 403`. This
+works today but is fragile. The next developer who writes a similar
+route might not add the check. Query scoping is the only approach
+where forgetting the check is structurally impossible.
+
+---
+
+### Insecure direct object references
+
+**What it is.** An insecure direct object reference (IDOR) is a
+vulnerability where an attacker changes an identifier in a URL or
+request to access a record that belongs to someone else. For example,
+changing `?id=abc123` to `?id=abc124` to see the next user's record.
+
+**Why it is needed.** Without ownership enforcement, knowing or
+guessing a record's identifier is enough to access it. If identifiers
+are sequential numbers (1, 2, 3...) an attacker can iterate through
+every record in the system. Even random identifiers are vulnerable
+without query scoping — the identifier alone should never be sufficient
+to grant access.
+
+**How I implemented it.** SafeVoice uses two mitigations. First, the
+publicId is a cuid — a collision-resistant unique identifier that is
+not sequential and cannot be guessed by incrementing. Second, and more
+importantly, every query requires both the publicId AND the userId to
+match. Even if an attacker obtains another user's publicId, the query
+returns null because the userId does not match. The response is 404,
+not 403 — this prevents the attacker from learning that the record
+exists at all.
+
+**What I chose against, and why.** Returning 403 instead of 404 when
+a record exists but belongs to another user would be more technically
+accurate but would confirm to an attacker that a record with that
+identifier exists. 404 leaks less information.
+
+---
+
+### Why raw database identifiers are not exposed
+
+**What it is.** A raw database identifier is the primary key generated
+by the database — in Prisma, a cuid like `clxxx...`. Exposing this in
+URLs or the interface reveals the internal structure of the database and
+gives attackers a real identifier to use in IDOR attacks.
+
+**Why it is needed.** If the URL shows `/records/clxxx...` where
+`clxxx...` is the actual database primary key, an attacker who obtains
+one valid key has a real identifier format to iterate on. Separating
+the public identifier from the internal key means the internal key is
+never transmitted to the client.
+
+**How I implemented it.** The CaseNote table has two identifier
+columns: `id` (the internal Prisma cuid, never sent to the client)
+and `publicId` (a separate cuid used in all URLs and API responses).
+The `select` clauses in all queries explicitly omit `id`. Only
+`publicId` appears in URLs and API responses.
+
+**What I chose against, and why.** Using a short human-readable code
+like `NOTE-A3F7K` would make URLs more readable but would require a
+custom generation function and a uniqueness check on every create.
+A separate cuid for publicId gives the same security benefit with
+Prisma handling uniqueness automatically.
+
+---
+
+### Audit logging and why deletions are recorded
+
+**What it is.** An audit log is an append-only record of significant
+actions — in SafeVoice, every deletion. Each row captures who did it,
+what they did, which record was affected, and when it happened. The
+audit log is written before the deletion, not after.
+
+**Why it is needed.** Once a record is deleted, it is gone. Without
+an audit log, there is no evidence that the record ever existed, who
+deleted it, or when. For a GBV case management system, deletion
+history is not optional — a case worker or administrator may need to
+verify that a specific note was deleted and by whom.
+
+**How I implemented it.** In `app/api/records/[publicId]/route.ts`,
+the DELETE handler writes to the AuditLog table before calling
+`db.caseNote.delete`. The audit row contains the userId, the action
+string DELETE, the entityType CaseNote, the entityId (the publicId
+of the deleted record), and metadata including the note title and
+ISO timestamp. If the audit write fails, the deletion does not
+proceed.
+
+**What I chose against, and why.** Writing the audit log after the
+deletion is the wrong order. If the deletion succeeds but the audit
+write then fails due to a database error, the record is gone with no
+audit trail. Writing the audit first means that if the deletion fails,
+there is a harmless orphaned audit row — far better than a deletion
+with no record.
+
+---
+
+### Page architecture — conditional rendering with URL state
+
+**What it is.** Conditional rendering with URL state means showing
+different views on the same page based on query parameters in the URL,
+rather than navigating to separate pages. In SafeVoice records,
+`?view=list`, `?view=create`, and `?view=detail&id={publicId}` all
+render different content on the same `/records` route without a full
+page reload.
+
+**Why it is needed.** Without URL state, navigation between views
+would either require separate pages (full page reload each time) or
+use React state with no URL update (views that cannot be bookmarked
+or shared). URL state gives the speed of client-side navigation with
+the shareability of distinct URLs.
+
+**How I implemented it.** The records page reads `searchParams` from
+`useSearchParams()` on every render. The `view` and `id` parameters
+control which section renders. The `setView` function uses
+`router.push` with a constructed URL to update the browser address
+bar. This means every view — list, create, detail — has a distinct
+URL that can be bookmarked, shared, or reached directly.
+
+**What I chose against, and why.** Using separate pages
+(`/records/create`, `/records/{id}`) would be the conventional
+Next.js approach. It would require full page reloads on every
+navigation and would not satisfy the assessment requirement for
+views that change without full page loads.
+
+---
+
+### Status codes — 401 versus 403
+
+**What it is.** HTTP 401 means the request is unauthenticated — the
+server does not know who is making the request. HTTP 403 means the
+request is authenticated but forbidden — the server knows who you are
+and has decided you are not allowed. These are distinct situations
+requiring distinct responses.
+
+**Why it is needed.** Returning 401 when a user is authenticated but
+accessing the wrong record is misleading — it tells the client to
+re-authenticate, which will not help. Returning 403 when there is no
+session is also wrong — the client should be directed to sign in, not
+told they are forbidden.
+
+**How I implemented it.** Every route checks for a valid session token
+first. If no session exists, it returns 401. Ownership violations
+return 404 rather than 403 in this implementation — because returning
+403 would confirm the record exists, leaking information to an
+attacker. A missing or wrong session returns 401. A found-but-not-owned
+record returns 404.
+
+**What I chose against, and why.** Returning 403 for ownership
+violations is more technically precise but leaks that the record
+exists. 404 is chosen deliberately to prevent information disclosure
+about other users' records.
+
+---
+
+### Database indexing
+
+**What it is.** A database index is a data structure that allows the
+database to find rows matching a condition without scanning every row
+in the table. Without an index on `userId`, every query that filters
+by userId reads every row in the CaseNote table to find the matching
+ones.
+
+**Why it is needed.** At small scale with a few records, a full table
+scan is fast enough to be invisible. At production scale with thousands
+of records, a full table scan on every list request would make the
+page slow and create unnecessary database load. An index on userId
+makes the list query take the same time regardless of how many records
+exist in total.
+
+**How I implemented it.** The CaseNote model in `schema.prisma` has
+`@@index([userId])` and `@@index([publicId])`. Prisma generated these
+as B-tree indexes in PostgreSQL. The SQL confirmed by Neon:
+
+```sql
+CREATE INDEX "CaseNote_userId_idx" ON public."CaseNote" USING btree ("userId")
+CREATE INDEX "CaseNote_publicId_idx" ON public."CaseNote" USING btree ("publicId")
+```
+
+**What I chose against, and why.** Not adding indexes is the default
+if you do not specify them. The primary key index is created
+automatically. Custom indexes on query columns must be declared
+explicitly. Leaving them out produces correct results at assessment
+scale but wrong performance at production scale.
+
+---
+
+### Query count as a cost
+
+**What it is.** Query count is the number of database round trips an
+operation requires. Every round trip has a cost — network latency,
+database CPU, and connection overhead. Reducing unnecessary queries
+makes operations faster and cheaper.
+
+**Why it is needed.** An operation that makes 5 database queries where
+2 would suffice is 2.5 times slower than it needs to be at the
+database level. Over thousands of requests per day, unnecessary queries
+add up to significant latency and cost.
+
+**How I implemented it.** I measured queries for each main action:
+
+| Action | Initial query count | Final query count | Reduction |
+|---|---|---|---|
+| List records | 2 (auth + fetch) | 2 | None needed — already optimal |
+| View detail | 2 (auth + fetch) | 2 | None needed — already optimal |
+| Delete record | 4 (auth + find + audit + delete) | 4 | Irreducible — audit must be separate |
+
+The initial design had a separate ownership check after the fetch —
+`findUnique` then compare `userId`. I eliminated this by including
+`userId` in the `findFirst` where clause, reducing the detail and
+delete flows from 3 fetches to 2. The audit write and the delete
+cannot be combined into a single query because they operate on
+different tables.
+
+**What I chose against, and why.** Using a Prisma transaction to
+combine the audit write and delete into a single atomic operation
+would reduce the risk of one succeeding without the other but would
+not reduce the query count — both queries still execute inside the
+transaction. The count reduction came from eliminating the post-fetch
+ownership check, not from combining queries.
+
+---
+
+## Section 6: What Went Wrong
+
+### Problem 1: Session confusion during access control testing
+
+**Symptom.** During the access control audit test, running a DELETE
+request from user 1's browser against a publicId that was believed to
+belong to user 2 returned success instead of 404.
+
+**Investigation.** I checked the Neon CaseNote table after the
+deletion. The table was empty. I checked the User table and compared
+userId values against the CaseNote records that had existed. I
+verified which email address was shown on the dashboard in each
+browser window.
+
+**Cause.** The incognito window had not been properly signed in as
+user 2. The session cookie in the incognito window belonged to user 1,
+not user 2. The DELETE request targeted a record that actually belonged
+to user 1 — which is why it succeeded. The access control was working
+correctly. The test setup was wrong.
+
+**Fix.** I verified both sessions by checking the dashboard email
+display in each window. I confirmed the CaseNote userId matched the
+expected user before running the test. The access control code was
+not changed because it was correct — the issue was test procedure,
+not implementation.
+
+---
+
+### Problem 2: Neon database sleeping between assessment builds
+
+**Symptom.** After switching from Assessment 3 to Assessment 4, the
+first `npx prisma db push` returned `P1001: Can't reach database
+server`.
+
+**Investigation.** I checked the Neon dashboard. The database was
+showing as Idle after the period of inactivity between assessments.
+
+**Cause.** Neon free tier scales to zero after 5 minutes of inactivity.
+The gap between finishing Assessment 3 and starting Assessment 4 was
+long enough for the database to sleep.
+
+**Fix.** I visited `http://localhost:3000/dashboard` in the browser to
+make a database request and wake Neon up. After 30 seconds the database
+was active and `prisma db push` succeeded.
+
+---
+
+### Problem 3: publicId not appearing in the URL initially
+
+**Symptom.** Clicking on a note from the list did not update the URL
+with the publicId. The URL stayed as `/records` with no query
+parameters.
+
+**Investigation.** I checked the `setView` function in the records
+page. I checked whether `router.push` was being called. I added a
+console.log to verify the publicId was being passed.
+
+**Cause.** The `onClick` handler on the list items was calling
+`setView('detail', note.publicId)` but the `setView` function had a
+bug — it was building the URL params correctly but not including the
+`id` parameter when the view was `detail`.
+
+**Fix.** I corrected the `setView` function to always include the `id`
+parameter when the view is `detail`. After the fix, clicking a note
+updated the URL to `?view=detail&id={publicId}` correctly.
+
+---
+
+## Section 7: What This Slice Does Not Handle
+
+**Outside the brief by design:**
+- Editing records — create and delete only as required by the brief
+- Search or filtering — not required by the brief
+- Sharing or collaboration — not required by the brief
+- Tags or categories — not required by the brief
+
+**Would need before real users:**
+- Soft delete — currently deletion is permanent. A production GBV
+  case management system would likely require soft delete with a
+  recovery window rather than immediate permanent deletion.
+- Pagination — the list query currently returns the 20 most recent
+  records. At scale, pagination or infinite scroll is required.
+- The access control audit table should be tested with automated
+  tests that create two users and verify cross-user access is
+  blocked on every route. Manual testing is insufficient for a
+  production system.
+- Rate limiting on the create endpoint — a user could create
+  thousands of records rapidly. A rate limit per user per hour
+  is needed at production scale.
+
+**Left out due to time:**
+- Automated access control tests covering every route
+- Query explain plan analysis to verify index usage
+
+---
+
+## Section 8: If I Built This Again
+
+If I built this again, I would write the access control tests before
+writing any route code. The most significant issue in Assessment 4 was
+discovering a test procedure error late in the process that initially
+appeared to be a security vulnerability. If I had written automated
+tests first — create two users, attempt cross-user access on every
+route, assert 404 — the access control behaviour would have been
+verified mechanically from the first route, not manually at the end.
+Manual testing of security properties is inherently unreliable because
+it depends on the tester setting up the test conditions correctly every
+time. Automated tests run the same conditions identically on every
+execution and do not suffer from session confusion or other human
+errors.
