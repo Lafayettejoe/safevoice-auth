@@ -20,6 +20,7 @@ model User {
   verificationCodes   VerificationCode[]
   passwordResetTokens PasswordResetToken[]
   subscription        Subscription?
+  aiJobs              AIJob[]
 }
 
 model Session {
@@ -123,5 +124,33 @@ enum PaymentStage {
   INITIATED
   VERIFIED
   FULFILLED
+  FAILED
+}
+
+// AIJob: tracks every upload and processing job
+model AIJob {
+  id              String     @id @default(cuid())
+  userId          String
+  user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fileKey         String     // storage key only — never the file itself
+  fileName        String
+  fileSize        Int
+  status          JobStatus  @default(PENDING)
+  attempts        Int        @default(0)
+  errorMessage    String?
+  transcriptText  String?
+  riskLevel       String?
+  riskRationale   String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETE
   FAILED
 }

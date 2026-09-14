@@ -153,6 +153,42 @@ export default async function DashboardPage() {
                     </div>
                 </div>
 
+                {/* AI Upload card */}
+                <div style={{
+                    backgroundColor: '#ffffff',
+                    borderRadius: '16px',
+                    padding: '24px 32px',
+                    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+                    border: '1px solid #e2f0e8',
+                    marginTop: '16px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                }}>
+                    <div>
+                        <p style={{ fontSize: '14px', fontWeight: 600, color: '#16181c', margin: '0 0 2px' }}>
+                            AI Voice Analysis
+                        </p>
+                        <p style={{ fontSize: '13px', color: '#6b7280', margin: 0 }}>
+                            Upload a voice recording for transcription and risk classification
+                        </p>
+                    </div>
+                    <a href="/upload" style={{ textDecoration: 'none' }}>
+                        <button style={{
+                            padding: '9px 20px',
+                            borderRadius: '8px',
+                            border: 'none',
+                            backgroundColor: '#0a4d2a',
+                            color: '#ffffff',
+                            fontSize: '13px',
+                            fontWeight: 600,
+                            cursor: 'pointer',
+                        }}>
+                            Upload recording
+                        </button>
+                    </a>
+                </div>
+
             </div>
         </div>
     )
