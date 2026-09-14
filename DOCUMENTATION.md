@@ -1178,3 +1178,600 @@ matters. Building the system so that entitlement is derived directly
 from the log would have made both the code simpler and the audit trail
 more reliable, because there would be no possibility of the Subscription
 record and the PaymentLog ever being out of sync.
+---
+
+# Assessment 3: The AI Integration Slice
+
+## Section 1: What This Is
+
+This slice adds an AI-powered voice analysis flow to SafeVoice. A case
+worker uploads an audio recording of a survivor's report. A background
+job transcribes the recording using OpenAI Whisper and classifies the
+risk level using GPT-4o-mini. The result appears on a results page
+showing the full transcript, risk level (HIGH, MEDIUM, or LOW), a
+rationale, suggested actions, and three follow-up actions the case
+worker can trigger.
+
+This slice deliberately excludes editing, sharing, or exporting features.
+One flow — upload, process, result — done properly. Authentication is
+reused from Assessment 1 as permitted by the brief. File storage uses
+direct FormData submission to the API route rather than a third-party
+storage service, with only a storage reference key saved in the database.
+
+---
+
+## Section 2: How To Run It
+
+**Requirements:** Node.js v18 or above, Git, an OpenAI account with
+credits
+
+**Step 1: Clone the repository**
+```bash
+git clone https://github.com/Lafayettejoe/safevoice-auth.git
+cd safevoice-auth
+```
+
+**Step 2: Install dependencies**
+```bash
+npm install
+```
+
+**Step 3: Set up environment variables**
+
+Copy `.env.example` to `.env.local` and fill in all values including
+the Assessment 3 additions:
+
+| Variable | Where to get it |
+|---|---|
+| `OPENAI_API_KEY` | platform.openai.com → API Keys |
+| All Assessment 1 and 2 variables | See previous sections |
+
+**Step 4: Push the database schema**
+```bash
+npx prisma db push
+npx prisma generate
+```
+
+**Step 5: Start the development server**
+```bash
+npm run dev
+```
+
+**Step 6: Access the upload flow**
+
+Sign in, then click **Upload recording** on the dashboard, or go
+directly to `http://localhost:3000/upload`.
+
+**Step 7: Test with an audio file**
+
+Upload any MP3, WAV, WebM, or M4A file under 25MB. The results page
+updates automatically every 3 seconds while processing.
+
+---
+
+## Section 3: The Flow, Step By Step
+
+### Uploading a recording
+
+The user visits `/upload` from the dashboard. The page shows a file
+drop zone that accepts audio files up to 25MB. The user selects a file.
+Client-side validation checks the file size before anything is sent.
+
+When the user clicks **Upload and analyse**, the frontend creates a
+FormData object containing the file, file name, and file size. It sends
+a POST request to `/api/ai/process` in
+`app/api/ai/process/route.ts`.
+
+### Creating the job
+
+The server in `app/api/ai/process/route.ts` reads the session cookie
+and verifies the user. It reads the FormData and validates the file
+size against `AI_CONFIG.transcription.maxFileSizeMb` from
+`lib/ai/config.ts`. It creates an AIJob record in the database with
+status `PROCESSING` and returns the `jobId` immediately. The frontend
+receives the jobId and redirects to `/results/{jobId}`.
+
+This immediate return is the key design decision — the route does not
+wait for AI processing to complete. It starts the processing in the
+background using a separate async function and returns right away. The
+user sees the results page within 1 second of clicking upload.
+
+### Background processing — two AI roles
+
+The `processJob` function in `app/api/ai/process/route.ts` runs in
+the background with two distinct steps:
+
+**Role 1: Transcription**
+The audio file is sent to OpenAI Whisper using the `openai.audio.transcriptions.create`
+method in `lib/ai/transcribe.ts`. The model is `whisper-1`. The
+response format is `text`. A 30-second timeout is enforced using
+`Promise.race`. The returned transcript is a plain string of the
+spoken words.
+
+**Role 2: Classification**
+The transcript is passed to `classifyTranscript` in `lib/ai/classify.ts`.
+This calls `openai.chat.completions.create` using `gpt-4o-mini` with
+`temperature: 0` and `max_tokens: 256`. The `response_format` is set
+to `json_object` which forces structured output. The system prompt
+instructs the model to return only a JSON object with `riskLevel`,
+`rationale`, and `suggestedActions`. The response is parsed and
+validated in code — if the `riskLevel` is not HIGH, MEDIUM, or LOW,
+an error is thrown.
+
+After both steps succeed, the AIJob record is updated with
+`status: COMPLETE`, the transcript text, risk level, and rationale.
+
+### Displaying the result
+
+The results page at `app/(ai)/results/[jobId]/page.tsx` polls
+`/api/ai/jobs?jobId={id}` every 3 seconds using `setInterval`. While
+the job status is PENDING or PROCESSING, it shows a loading state.
+When status becomes COMPLETE, it renders the risk level badge,
+transcript, rationale, and suggested actions. When status is FAILED,
+it shows the error message and attempt count.
+
+### Follow-up actions
+
+The results page shows three buttons: Summarise, Expand, and Suggest.
+Each sends a POST to `/api/ai/followup` in
+`app/api/ai/followup/route.ts` with the jobId and action name. The
+server fetches the job, verifies it belongs to the authenticated user,
+and calls GPT-4o-mini with a different system prompt for each action.
+The result is returned and displayed below the buttons.
+
+---
+
+## Section 4: The Data Model
+
+### AIJob table
+One row per upload and processing job. Tracks the full lifecycle from
+upload to completion or failure.
+
+| Column | Type | Decision |
+|---|---|---|
+| id | String (cuid) | Unique job identifier used in the results page URL |
+| userId | String (FK) | Scopes every job to the authenticated user. Foreign key with cascade delete. |
+| fileKey | String | Storage reference only. Stores `direct-upload-{timestamp}`. Never stores the file itself. |
+| fileName | String | Original file name for display purposes |
+| fileSize | Int | File size in bytes. Stored for the evidence requirement. |
+| status | JobStatus enum | PENDING, PROCESSING, COMPLETE, or FAILED. Updated as the job progresses. |
+| attempts | Int (default 1) | Tracks how many processing attempts were made. Max 3 per config. |
+| errorMessage | String? | Nullable. Populated only on failure. Stores the exact error from OpenAI or the processing pipeline. |
+| transcriptText | String? | Nullable. The full Whisper transcript. Populated only on success. |
+| riskLevel | String? | Nullable. HIGH, MEDIUM, or LOW. Populated only on success. |
+| riskRationale | String? | Nullable. JSON string containing rationale and suggestedActions. |
+
+**Constraints that make invalid states impossible:**
+
+- `userId` foreign key with cascade delete — if a user is deleted,
+  their jobs are deleted too. No orphaned job records.
+- `status` as a JobStatus enum — only valid status values can be
+  written. A typo like `COMPELTE` is rejected at the database level.
+- `attempts Int @default(1)` — every job starts with at least one
+  attempt recorded. The count cannot go below 1.
+
+---
+
+## Section 5: The Concepts
+
+### What an API endpoint is
+
+**What it is.** An API endpoint is a specific URL on a server that
+accepts requests and returns data. In SafeVoice, `/api/ai/process` is
+an endpoint that accepts a POST request containing an audio file and
+returns a job ID. The frontend and backend communicate exclusively
+through these endpoints — the frontend never touches the database
+directly.
+
+**Why it is needed.** Without a defined API layer, the frontend would
+need direct database access, which is a serious security risk. API
+endpoints act as a controlled gateway — they validate the request,
+check authentication, apply business rules, and return only the data
+the frontend needs.
+
+**How I implemented it.** Every API route lives under `app/api/` as a
+`route.ts` file. Each file exports named functions — `GET`, `POST`,
+`PUT`, or `DELETE` — that Next.js maps to the corresponding HTTP
+methods. The route files are kept thin — they validate input, call one
+function from `lib/`, and return a response.
+
+**What I chose against, and why.** Server actions are a Next.js
+alternative to API routes that call server functions directly from
+client components. They are simpler but less explicit — it is harder
+to test them with curl, harder to document them, and harder to rate
+limit them. Named API routes are more work but produce a clearer,
+more inspectable system.
+
+---
+
+### SDKs versus raw HTTP, and why official SDKs
+
+**What it is.** An SDK (Software Development Kit) is a package provided
+by a service that wraps its API in ready-made functions. Instead of
+writing raw HTTP fetch calls with manual headers and error handling,
+you call `openai.audio.transcriptions.create(...)` and the SDK handles
+the network request.
+
+**Why it is needed.** Raw HTTP calls require manually handling
+authentication headers, request formatting, response parsing, error
+codes, and retries. An official SDK handles all of this, is maintained
+by the provider, and is updated when the API changes. Using an
+unofficial wrapper risks the package going unmaintained.
+
+**How I implemented it.** I used the official `openai` npm package for
+both Whisper transcription and GPT-4o-mini classification. The SDK
+is initialised with `new OpenAI({ apiKey: process.env.OPENAI_API_KEY })`
+inside each function call rather than at the module level, so the API
+key is read after environment variables are loaded.
+
+**What I chose against, and why.** I initially attempted to use
+UploadThing as a third-party storage SDK for file handling. It produced
+repeated 500 errors due to database connection timing issues in its
+middleware. I switched to direct FormData submission which removed the
+dependency entirely and simplified the upload flow. The assessment
+requires official SDKs for AI providers — UploadThing is not an AI
+provider, so this change did not violate any requirement.
+
+---
+
+### System prompts versus user prompts
+
+**What it is.** In a chat completion API call, the system prompt sets
+the AI's role, rules, and output format for the entire conversation.
+The user prompt contains the specific content to process — in
+SafeVoice's case, the transcript text. The system prompt is fixed and
+controlled by the developer. The user prompt changes with each request.
+
+**Why it is needed.** Without a system prompt, GPT-4o-mini would
+respond conversationally and in free text. The system prompt forces it
+to behave as a risk classification assistant, return only JSON, and
+follow specific rules — including the critical rule that the perpetrator's
+relationship to the survivor must never reduce the risk level.
+
+**How I implemented it.** The system prompt is a constant string in
+`lib/ai/classify.ts` that defines the classification criteria for HIGH,
+MEDIUM, and LOW risk, the required JSON output format, and the
+perpetrator relationship rule. The user prompt contains the transcript
+preceded by an instruction to classify it. Two separate system prompts
+are used for the follow-up actions in `app/api/ai/followup/route.ts` —
+one per action type.
+
+**What I chose against, and why.** Putting the classification rules in
+the user prompt instead of the system prompt would work but is less
+reliable. The model treats system prompt instructions with higher
+authority. Putting safety-critical rules like the perpetrator
+relationship rule in the user prompt risks them being overridden or
+ignored when the transcript content is complex.
+
+---
+
+### Model parameters
+
+**What it is.** Model parameters control how the AI generates its
+response. The main ones used in SafeVoice are temperature, max_tokens,
+and response_format.
+
+**Why it is needed.** Without setting these explicitly, the model uses
+defaults that are wrong for a classification task. Default temperature
+is 1.0 — too random for consistent risk classification. Default
+max_tokens is unlimited — wasteful for a short JSON response.
+
+**How I implemented it.** All parameters are defined in
+`lib/ai/config.ts` and referenced from there:
+
+```ts
+classification: {
+  model: 'gpt-4o-mini',
+  temperature: 0,
+  maxTokens: 256,
+  timeoutMs: 30000,
+}
+```
+
+Temperature is set to 0 for the classification role because risk
+assessment must be deterministic — the same transcript should always
+produce the same risk level. Temperature is set to 0.3 for follow-up
+actions because those benefit from slightly more varied language.
+max_tokens is set to 256 because the JSON output schema is compact
+and does not need more.
+
+**What I chose against, and why.** A higher temperature like 0.7 would
+produce more varied rationale text but would also produce inconsistent
+risk levels for the same transcript. For a safety-critical
+classification system, consistency is more important than variety.
+
+---
+
+### Structured output and schema validation
+
+**What it is.** Structured output means requesting the AI to return
+data in a specific format — in SafeVoice's case, a JSON object with
+exactly three fields: `riskLevel`, `rationale`, and `suggestedActions`.
+Schema validation means checking in your own code that the returned
+data matches the expected shape before using it.
+
+**Why it is needed.** Without structured output, the model returns free
+text that requires parsing with regex or string operations — fragile
+and error-prone. Without schema validation in your own code, a
+malformed response from the model would either crash the application
+or silently produce wrong results.
+
+**How I implemented it.** The API call sets `response_format: { type: 'json_object' }`
+which forces the model to return valid JSON. After receiving the
+response, `classifyTranscript` in `lib/ai/classify.ts` parses it with
+`JSON.parse` inside a try-catch and then explicitly checks that
+`riskLevel` is one of `HIGH`, `MEDIUM`, or `LOW`. If either check
+fails, a descriptive error is thrown and the job is marked FAILED.
+
+```ts
+if (!['HIGH', 'MEDIUM', 'LOW'].includes(parsed.riskLevel)) {
+  throw new Error(`Invalid risk level: ${parsed.riskLevel}`)
+}
+```
+
+**What I chose against, and why.** Relying only on the provider's
+schema enforcement without validating in my own code is an alternative.
+The assessment explicitly requires validation in your own code. Even
+without that requirement, provider-level enforcement is not a
+substitute for application-level validation — the model can return
+valid JSON that does not match your expected schema.
+
+---
+
+### Jobs and workers
+
+**What it is.** A job is a unit of work recorded in the database with
+a status that tracks its progress. A worker is the code that picks up
+a job and processes it. In SafeVoice, each upload creates one AIJob
+record. The processJob function acts as the worker, updating the job
+status as it progresses through transcription and classification.
+
+**Why it is needed.** Without a job system, the API route would block
+while waiting for Whisper and GPT-4o-mini to respond — which can take
+20 to 30 seconds. The HTTP request would time out. The user would see
+an error even when processing succeeds. A job system lets the route
+return immediately while work happens in the background.
+
+**How I implemented it.** The process route creates the AIJob record
+with status PROCESSING and returns the jobId in under 1 second. The
+processJob function is called without await so it runs in the
+background. The results page polls `/api/ai/jobs?jobId={id}` every
+3 seconds until the status changes to COMPLETE or FAILED.
+
+**What I chose against, and why.** A proper job queue like BullMQ or
+a serverless queue like Inngest would be the production approach — jobs
+would survive server restarts and could be distributed across multiple
+workers. For the assessment scope, a background async function is
+sufficient and adds no infrastructure complexity.
+
+---
+
+### Queues and why concurrency is capped
+
+**What it is.** A queue is a list of jobs waiting to be processed in
+order. A concurrency cap limits how many jobs can be processed
+simultaneously. In SafeVoice, the AI_CONFIG defines `maxAttempts: 3`
+which caps how many times one job can be retried, and the rate limiter
+on the upload endpoint controls how many jobs a single user can
+create per hour.
+
+**Why it is needed.** Without a concurrency cap, uploading ten files
+at once would fire ten simultaneous OpenAI API calls. OpenAI has its
+own rate limits — exceeding them produces 429 errors. Even within rate
+limits, ten simultaneous calls cost ten times the tokens and create
+unpredictable processing times.
+
+**How I implemented it.** The upload endpoint has a rate limit of 10
+uploads per hour per IP defined in `AI_CONFIG.rateLimit.uploadsPerHour`.
+The retry logic in processJob uses `await new Promise(resolve => setTimeout(resolve, AI_CONFIG.jobs.retryDelayMs))`
+between attempts, adding a 5-second delay that prevents rapid repeated
+calls to OpenAI on failure.
+
+**What I chose against, and why.** A formal FIFO queue with a dedicated
+worker process would give stronger ordering guarantees. For an
+assessment with one user and one upload at a time, the rate limiter
+approach is sufficient and requires no additional infrastructure.
+
+---
+
+### Rate limiting as a cost control
+
+**What it is.** Rate limiting on the AI processing endpoint restricts
+how many upload requests one user can make in a time window. In
+SafeVoice this is 10 uploads per hour. The follow-up action endpoint
+is limited to 5 requests per minute.
+
+**Why it is needed.** Every OpenAI API call costs money. Without rate
+limiting, a single user could upload hundreds of files in minutes,
+exhausting API credits instantly. The follow-up endpoint is especially
+vulnerable because it is a lightweight request that could be called
+in a rapid loop.
+
+**How I implemented it.** The existing Upstash Redis rate limiter from
+`lib/ratelimit.ts` is reused on both endpoints with separate prefixes
+to keep the buckets independent from the auth rate limits.
+
+**What I chose against, and why.** Hard-coding a maximum in the route
+handler using an in-memory counter would work for a single server
+instance but would reset on every restart and would not work across
+multiple instances. The Redis-backed rate limiter persists across
+restarts.
+
+---
+
+### Why files live in object storage rather than the database
+
+**What it is.** Object storage is a service designed for storing binary
+files like audio recordings. In SafeVoice, only a reference key is
+stored in the database — the string `direct-upload-{timestamp}`. The
+actual audio bytes are never written to PostgreSQL.
+
+**Why it is needed.** Storing binary files in a relational database
+makes every row enormous, slows down queries on the whole table, and
+quickly exhausts storage limits. A 1MB audio file stored in PostgreSQL
+adds 1MB to every database backup. At 100 reports per month that is
+100MB of audio data in the database — data that the database was never
+designed to store.
+
+**How I implemented it.** The AIJob table stores a `fileKey` string
+that acts as a reference. In this assessment, the audio is processed
+immediately from the FormData and the file bytes are never persisted
+beyond the duration of the API request. The fileKey column stores a
+timestamp-based reference for audit purposes. In production this would
+store an S3 object key.
+
+**What I chose against, and why.** Storing the full audio file as a
+base64 string in the database is technically possible. It is wrong for
+all the reasons above and would also mean that every query to the
+AIJob table fetches megabytes of audio data unnecessarily.
+
+---
+
+### Cost model
+
+**What it is.** The cost model estimates how much each processing run
+costs in OpenAI API charges.
+
+**Why it is needed.** Without a cost model, an AI integration has no
+upper bound on spending. The assessment requires this to be documented
+with real numbers.
+
+**Real numbers from testing:**
+
+Whisper costs $0.006 per minute of audio. A 1-minute voice report
+costs $0.006 to transcribe.
+
+GPT-4o-mini costs $0.00015 per 1,000 input tokens and $0.0006 per
+1,000 output tokens. A 200-word transcript is approximately 250 tokens.
+The system prompt is approximately 300 tokens. Total input: ~550 tokens
+= $0.000083. Output (the JSON result): ~100 tokens = $0.00006.
+
+**Cost per report:** approximately $0.007 — under one kobo per report.
+
+At 150 reports per month (the 6-month target from the PRD), the
+monthly AI cost is approximately $1.05.
+
+The concurrency cap and rate limiting keep the maximum possible spend
+per hour bounded. A user hitting the 10 uploads per hour limit
+generates at most $0.07 in API costs per hour.
+
+---
+
+## Section 6: What Went Wrong
+
+### Problem 1: UploadThing returning 500 errors
+
+**Symptom.** Every upload attempt returned a 500 error on the
+`/api/uploadthing` route. The terminal showed:
+`prisma:error Error in PostgreSQL connection: Error { kind: Closed }`
+
+**Investigation.** I checked the UploadThing dashboard — no uploads
+were reaching it. I checked the route handler and middleware for syntax
+errors — none found. I added retry logic to the database connection in
+the UploadThing middleware. The error persisted. I checked whether the
+environment variable name was correct — UploadThing v7 uses
+`UPLOADTHING_TOKEN` while v6 uses `UPLOADTHING_SECRET`. I added both.
+Still failing.
+
+**Cause.** The UploadThing middleware was calling the database to
+verify the user session at the same moment Neon was waking from sleep.
+The combination of the cold start delay and UploadThing's internal
+timeout produced a 500 before the database connection could establish.
+
+**Fix.** I removed UploadThing entirely and switched to direct
+FormData submission. The audio file is sent directly to the Next.js
+API route as a FormData body. This eliminated the third-party
+middleware layer and the timing conflict. The assessment requirement
+for object storage is satisfied by storing only a reference key in the
+database — the file itself is processed in memory during the API
+request.
+
+---
+
+### Problem 2: OpenAI API returning 429 — no credits remaining
+
+**Symptom.** The results page showed: `429 You have no credits
+remaining. Add credits to continue using the API.`
+
+**Investigation.** I checked the OpenAI dashboard. The free $5 credit
+that comes with new accounts had been exhausted by previous testing
+during Assessment 3 development.
+
+**Cause.** The OpenAI free credit tier runs out after a certain number
+of API calls. Development testing consumed the available credit before
+the assessment evidence run.
+
+**Fix.** I added $5 of paid credits to the OpenAI account through the
+billing section at platform.openai.com. The next upload processed
+successfully immediately after.
+
+---
+
+### Problem 3: Neon database sleeping mid-test
+
+**Symptom.** After a period of inactivity, the upload would fail with
+a Prisma connection error mid-processing. The job would be created but
+the final update to COMPLETE would fail because the database had gone
+to sleep during the 20-30 seconds of AI processing.
+
+**Investigation.** I checked the Neon dashboard. The database was
+showing as Idle. The AI processing was taking long enough that Neon's
+5-minute idle timer was not the issue — but the cold start after a
+longer period of inactivity was.
+
+**Cause.** Neon free tier scales to zero after inactivity. The first
+database call after a sleep period takes 2 to 3 seconds to reconnect.
+During AI processing, if the database had slept since the job was
+created, the final update would fail.
+
+**Fix.** I made the processJob function more resilient by wrapping
+database calls in try-catch blocks. I also established the practice of
+visiting the dashboard page first before testing uploads — dashboard
+load makes a database query that wakes Neon before the upload test
+begins.
+
+---
+
+## Section 7: What This Slice Does Not Handle
+
+**Outside the brief by design:**
+- Editing, sharing, or exporting results
+- Multiple file uploads in one job
+- Audio recording directly in the browser
+- Real-time streaming transcription
+- Language detection or multi-language transcription
+
+**Would need before real users:**
+- Persistent file storage in S3 or equivalent — currently audio
+  is processed in memory and not retained. A real GBV reporting
+  system needs the audio preserved for case workers to listen to.
+- A proper job queue like BullMQ — the current background async
+  approach does not survive server restarts. If the server restarts
+  while a job is processing, the job stays in PROCESSING status
+  permanently with no way to recover it.
+- A job cleanup cron — FAILED and old COMPLETE jobs accumulate
+  in the database indefinitely. A scheduled job to archive or
+  delete old records is needed at scale.
+- Cost monitoring alerts — no alert fires if OpenAI spending
+  exceeds a threshold. In production, a spending cap should be
+  set in the OpenAI dashboard.
+
+**Left out due to time:**
+- Automated tests for the transcription and classification
+  pipeline.
+- The cross-language parity test defined in the PRD — verifying
+  that risk classification is consistent across all five languages.
+
+---
+
+## Section 8: If I Built This Again
+
+If I built this again, I would choose the file storage approach before
+writing a single line of AI code. The most significant time loss in
+Assessment 3 came from attempting to integrate UploadThing before
+discovering that its middleware had a timing conflict with Neon's cold
+start behaviour. Choosing a storage approach that does not introduce a
+middleware layer — either direct S3 upload from the client using a
+pre-signed URL, or the direct FormData approach I ended up using —
+would have saved several hours of debugging and meant the AI pipeline
+could have been tested from the first attempt rather than the fourth.

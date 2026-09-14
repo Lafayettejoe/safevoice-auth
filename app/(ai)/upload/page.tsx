@@ -13,14 +13,7 @@ export default function UploadPage() {
         const selected = e.target.files?.[0]
         if (!selected) return
 
-        const validTypes = ['audio/webm', 'audio/mp3', 'audio/mpeg', 'audio/wav', 'audio/mp4', 'audio/m4a']
-        const maxSize = 25 * 1024 * 1024 // 25MB
-
-        if (!validTypes.includes(selected.type) && !selected.name.match(/\.(mp3|mp4|wav|webm|m4a|mpeg)$/i)) {
-            setError('Please upload an audio file (MP3, WAV, WebM, or M4A)')
-            return
-        }
-
+        const maxSize = 25 * 1024 * 1024
         if (selected.size > maxSize) {
             setError('File must be under 25MB')
             return
@@ -37,36 +30,22 @@ export default function UploadPage() {
         setError('')
 
         try {
-            // Step 1: Get UploadThing upload URL
             const formData = new FormData()
             formData.append('file', file)
+            formData.append('fileName', file.name)
+            formData.append('fileSize', file.size.toString())
 
-            const uploadResponse = await fetch('/api/uploadthing', {
+            const response = await fetch('/api/ai/process', {
                 method: 'POST',
                 body: formData,
             })
 
-            if (!uploadResponse.ok) {
-                throw new Error('Upload failed')
+            if (!response.ok) {
+                const data = await response.json()
+                throw new Error(data.error || 'Processing failed')
             }
 
-            const uploadData = await uploadResponse.json()
-            const { fileKey, fileUrl, fileName, fileSize } = uploadData[0]
-
-            // Step 2: Trigger AI processing
-            const processResponse = await fetch('/api/ai/process', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fileKey, fileUrl, fileName, fileSize }),
-            })
-
-            if (!processResponse.ok) {
-                throw new Error('Processing failed to start')
-            }
-
-            const { jobId } = await processResponse.json()
-
-            // Step 3: Go to results page
+            const { jobId } = await response.json()
             router.push(`/results/${jobId}`)
 
         } catch (err) {
@@ -82,7 +61,6 @@ export default function UploadPage() {
             backgroundColor: '#f0faf4',
             fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         }}>
-            {/* Top nav */}
             <div style={{
                 backgroundColor: '#ffffff',
                 borderBottom: '1px solid #e2f0e8',
@@ -106,7 +84,6 @@ export default function UploadPage() {
                     Upload an audio recording. SafeVoice will transcribe it and assess the risk level automatically.
                 </p>
 
-                {/* Upload card */}
                 <div style={{
                     backgroundColor: '#ffffff',
                     borderRadius: '16px',
@@ -114,7 +91,6 @@ export default function UploadPage() {
                     boxShadow: '0 1px 4px rgba(0,0,0,0.06), 0 8px 24px rgba(10,77,42,0.08)',
                     border: '1px solid #e2f0e8',
                 }}>
-                    {/* Drop zone */}
                     <label
                         htmlFor="audio-upload"
                         style={{
@@ -125,7 +101,6 @@ export default function UploadPage() {
                             textAlign: 'center',
                             cursor: 'pointer',
                             backgroundColor: file ? '#f0faf4' : '#fafafa',
-                            transition: 'all 0.2s',
                             marginBottom: '24px',
                         }}
                     >
@@ -138,12 +113,12 @@ export default function UploadPage() {
                         <p style={{ fontSize: '13px', color: '#6b7280', margin: 0 }}>
                             {file
                                 ? `${(file.size / (1024 * 1024)).toFixed(2)} MB`
-                                : 'MP3, WAV, WebM, or M4A — maximum 25MB'}
+                                : 'MP3, WAV, WebM, M4A — maximum 25MB'}
                         </p>
                         <input
                             id="audio-upload"
                             type="file"
-                            accept="audio/*"
+                            accept="audio/*,.mp3,.wav,.webm,.m4a,.ogg,.opus,.aac"
                             onChange={handleFileChange}
                             style={{ display: 'none' }}
                         />
@@ -182,9 +157,9 @@ export default function UploadPage() {
 
                     <div style={{ marginTop: '20px', padding: '14px', borderRadius: '8px', backgroundColor: '#f0faf4' }}>
                         <p style={{ fontSize: '12px', color: '#5a6270', margin: 0, lineHeight: 1.6 }}>
-                            <strong style={{ color: '#0a4d2a' }}>How it works:</strong> Your audio is uploaded securely,
-                            transcribed using OpenAI Whisper, and classified by GPT-4o-mini. Only the storage key
-                            is saved in the database — never the audio file itself.
+                            <strong style={{ color: '#0a4d2a' }}>How it works:</strong> Your audio is sent
+                            securely to OpenAI Whisper for transcription, then classified by GPT-4o-mini.
+                            Only a storage reference is saved in the database — never the audio file itself.
                         </p>
                     </div>
                 </div>
